@@ -1,0 +1,168 @@
+name: Build stable-diffusion.cpp (macOS)
+
+# Builds `sd-cli` from ONE pinned upstream commit of
+# github.com/leejet/stable-diffusion.cpp (MIT) for macOS, where upstream
+# publishes no usable binary for Ignix Creator (no Intel build; the Apple
+# Silicon build is unsigned and requires macOS 26). Nothing is patched: the
+# upstream sources are checked out at the exact commit and built with the
+# options below. Each archive carries the upstream licences, a build
+# provenance attestation and a SHA-256 that Ignix Creator pins.
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: 'Upstream release tag'
+        default: 'master-929-3f8527a'
+        required: true
+      upstream_commit:
+        description: 'Upstream commit (full SHA) the tag must point to'
+        default: '3f8527a46c54ecf4cb4ed6003da8e8982283c73c'
+        required: true
+      revision:
+        description: 'Build revision of this recipe (bump when build options change)'
+        default: '1'
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-sd-cpp
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: sd-cli (macOS ${{ matrix.arch }})
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-15
+            cmake_arch: arm64
+            # Metal GPU backend, shaders embedded in the binary.
+            options: '-DSD_METAL=ON -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON'
+          - arch: x64
+            runner: macos-15-intel
+            cmake_arch: x86_64
+            # Portable x86-64 CPU build (Haswell+: AVX2/FMA/F16C).
+            options: '-DSD_METAL=OFF -DGGML_METAL=OFF -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    env:
+      NAME: sd-cpp-${{ inputs.upstream_tag }}-r${{ inputs.revision }}-macos-${{ matrix.arch }}
+    steps:
+      - name: Check out upstream at the pinned commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: leejet/stable-diffusion.cpp
+          ref: ${{ inputs.upstream_commit }}
+          submodules: recursive
+          persist-credentials: false
+          path: src
+
+      - name: Verify the tag points to the pinned commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.upstream_tag }}
+          COMMIT: ${{ inputs.upstream_commit }}
+        run: |
+          set -euo pipefail
+          [ "$(git -C src rev-parse HEAD)" = "$COMMIT" ]
+          tagged=$(gh api "repos/leejet/stable-diffusion.cpp/git/ref/tags/$TAG" --jq .object.sha)
+          [ "$tagged" = "$COMMIT" ] || { echo "tag $TAG -> $tagged, expected $COMMIT"; exit 1; }
+          git -C src submodule status
+
+      - name: Configure
+        run: |
+          set -euo pipefail
+          cmake -S src -B build -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES=${{ matrix.cmake_arch }} \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3 \
+            -DGGML_NATIVE=OFF -DSD_WEBP=OFF -DSD_WEBM=OFF \
+            -DSD_BUILD_SHARED_LIBS=OFF -DBUILD_SHARED_LIBS=OFF \
+            ${{ matrix.options }}
+
+      - name: Build sd-cli
+        run: cmake --build build --config Release --target sd-cli -j "$(sysctl -n hw.ncpu)"
+
+      - name: Package with licences and an ad-hoc signature
+        run: |
+          set -euo pipefail
+          mkdir -p "$NAME"
+          cp build/bin/sd-cli "$NAME/sd-cli"
+          # Apple Silicon only runs signed code; an ad-hoc signature is enough
+          # for a binary Creator installs itself (no quarantine attribute).
+          codesign --force --sign - "$NAME/sd-cli"
+          codesign --verify --strict "$NAME/sd-cli"
+          # Only system libraries may be linked.
+          if otool -L "$NAME/sd-cli" | tail -n +2 | grep -vE '^\s+(/usr/lib/|/System/Library/)'; then
+            echo "unexpected dynamic dependency"; exit 1
+          fi
+          otool -l "$NAME/sd-cli" | grep -A4 LC_BUILD_VERSION
+          "$NAME/sd-cli" --help > /dev/null
+          cp src/LICENSE "$NAME/LICENSE"
+          {
+            echo "Ignix Creator build of stable-diffusion.cpp"
+            echo "Upstream: https://github.com/leejet/stable-diffusion.cpp"
+            echo "Tag: ${{ inputs.upstream_tag }}  Commit: ${{ inputs.upstream_commit }}"
+            echo "Build: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo
+            echo "Submodules:"; git -C src submodule status
+            for f in ggml/LICENSE thirdparty/LICENSE.darts_clone.txt thirdparty/oniguruma/COPYING thirdparty/utf8proc/LICENSE.md; do
+              echo; echo "================ $f"; cat "src/$f"
+            done
+            echo; echo "================ thirdparty/README.md (sources and licences)"; cat src/thirdparty/README.md
+            for f in thirdparty/json.hpp thirdparty/httplib.h thirdparty/zip.c thirdparty/miniz.h; do
+              echo; echo "================ $f (licence header)"; head -n 40 "src/$f"
+            done
+            echo; echo "================ thirdparty/stb_image.h (licence)"; tail -n 40 src/thirdparty/stb_image.h
+          } > "$NAME/THIRD_PARTY_NOTICES.txt"
+          # Reproducible-ish archive metadata: fixed owner and timestamps.
+          find "$NAME" -exec touch -t 202601010000 {} +
+          tar --uid 0 --gid 0 --uname '' --gname '' -czf "$NAME.tar.gz" "$NAME"
+          shasum -a 256 "$NAME.tar.gz" | tee "$NAME.tar.gz.sha256"
+          ( cd "$NAME" && shasum -a 256 ./* ) | tee "$NAME.files.sha256"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ env.NAME }}.tar.gz
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ env.NAME }}
+          path: |
+            ${{ env.NAME }}.tar.gz
+            ${{ env.NAME }}.tar.gz.sha256
+            ${{ env.NAME }}.files.sha256
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: sd-cpp-${{ inputs.upstream_tag }}-r${{ inputs.revision }}
+        run: |
+          set -euo pipefail
+          cd dist
+          cat ./*.tar.gz.sha256 > SHA256SUMS
+          cat ./*.files.sha256 > FILES.SHA256SUMS
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "stable-diffusion.cpp ${{ inputs.upstream_tag }} (build r${{ inputs.revision }})" \
+            --notes "sd-cli built from leejet/stable-diffusion.cpp @ ${{ inputs.upstream_commit }} by ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}. Provenance: https://github.com/${{ github.repository }}/attestations" \
+            ./*.tar.gz SHA256SUMS FILES.SHA256SUMS
